@@ -92,6 +92,36 @@ export async function encryptNote(dataKey: CryptoKey, plaintext: string): Promis
   return { iv, ciphertext };
 }
 
+export interface SealedData {
+  iv: Uint8Array;
+  ciphertext: ArrayBuffer;
+}
+
+async function sealWithKey(key: CryptoKey, data: Uint8Array): Promise<SealedData> {
+  const iv = randomBytes(12);
+  const ciphertext = await subtle.encrypt({ name: 'AES-GCM', iv }, key, data);
+  return { iv, ciphertext };
+}
+
+async function openWithKey(key: CryptoKey, sealed: SealedData): Promise<ArrayBuffer> {
+  return subtle.decrypt({ name: 'AES-GCM', iv: sealed.iv }, key, sealed.ciphertext);
+}
+
+/** 用数据密钥认证一段备份清单数据 */
+export function sealWithDataKey(dataKey: CryptoKey, data: Uint8Array): Promise<SealedData> {
+  return sealWithKey(dataKey, data);
+}
+
+/** 校验并打开由数据密钥认证的备份清单；篡改时 AES-GCM reject */
+export function openWithDataKey(dataKey: CryptoKey, sealed: SealedData): Promise<ArrayBuffer> {
+  return openWithKey(dataKey, sealed);
+}
+
+/** SHA-256 摘要；备份清单用它给外层每条密文记录建立绑定 */
+export async function sha256(data: Uint8Array): Promise<Uint8Array> {
+  return new Uint8Array(await subtle.digest('SHA-256', data));
+}
+
 /** AES-GCM 自带完整性校验：密文/IV 被篡改时 reject */
 export async function decryptNote(
   dataKey: CryptoKey,

@@ -1,4 +1,3 @@
-/** 便笺密文记录：只有密文、IV、修订号会落盘，明文永不持久化。 */
 export interface NoteRecord {
   id: string;
   /** 每条便笺独立的随机 IV（AES-GCM，96 bit） */
@@ -33,4 +32,38 @@ export interface NoteMeta {
   id: string;
   revision: number;
   updatedAt: number;
+}
+
+/** JSON 备份文件中可移植的封装密钥记录（二进制字段使用 base64） */
+export interface PortableWrappedKey {
+  kdf: {
+    salt: string;
+    iterations: number;
+  };
+  wrapIv: string;
+  wrappedKey: string;
+  revision: number;
+}
+
+/** 备份文件里的单条密文便笺（不含明文） */
+export interface PortableNote {
+  id: string;
+  iv: string;
+  ciphertext: string;
+  revision: number;
+  updatedAt: number;
+}
+
+/** 已格式化、带版本号的加密备份文件 */
+export interface BackupFile {
+  format: 'secure-notes-workbench-backup';
+  version: 1;
+  exportedAt: number;
+  wrappedKey: PortableWrappedKey;
+  /** 清单由数据密钥以 AES-GCM 加密并认证 */
+  manifest: {
+    iv: string;
+    ciphertext: string;
+  };
+  notes: PortableNote[];
 }

@@ -6,11 +6,12 @@ import {
   unwrapDataKey,
   wrapDataKey,
 } from './crypto';
+import { createBackupFile, parseBackupJson, verifyBackupWithDataKey } from './backup';
 import { META_WRAPPED_KEY, NotesDB } from './db';
-import { AuthError, LockedError } from './errors';
+import { AuthError, ConflictError, LockedError } from './errors';
 import type { LockBus } from './lockbus';
-import { NoteStore } from './store';
-import type { WrappedKeyRecord } from './types';
+import { MAX_NOTES, NoteStore } from './store';
+import type { BackupFile, WrappedKeyRecord } from './types';
 
 export interface SessionOptions {
   /** PBKDF2 迭代次数，测试可注入小值 */
@@ -68,23 +69,26 @@ export class Session {
     return (await this.db.getMeta<WrappedKeyRecord>(META_WRAPPED_KEY)) !== undefined;
   }
 
-  /** 首次使用：生成随机数据密钥，用口令派生的 KEK 封装后落盘 */
+  /** 首次使用：目标库必须确实为空；生成随机 DK 并用口令派生 KEK 封装后原子落盘 */
   async initialize(passphrase: string): Promise<void> {
-    if (await this.isInitialized()) {
-      throw new AuthError('工作台已初始化，请直接解锁');
-    }
     const generation = this.generation;
     const dataKey = await generateDataKey();
     const salt = randomBytes(16);
     const kek = await deriveKek(passphrase, salt, this.iterations);
     const { wrapIv, wrappedKey } = await wrapDataKey(dataKey, kek);
+    this.ensureGeneration(generation);
     const record: WrappedKeyRecord = {
       kdf: { salt, iterations: this.iterations },
       wrapIv,
       wrappedKey,
       revision: 1,
     };
-    await this.db.putMeta(META_WRAPPED_KEY, record);
+    try {
+      await this.db.initializeEmpty(record, () => this.ensureGeneration(generation));
+    } catch (err) {
+      if (err instanceof ConflictError) throw new AuthError('工作台已初始化，请直接解锁');
+      throw err;
+    }
     // 落盘完成期间可能恰好被（另一标签页的）锁定广播打断
     this.ensureGeneration(generation);
     this.setUnlocked(dataKey);
@@ -106,6 +110,76 @@ export class Session {
     // 本次结果必须作废，不能把已解锁状态/明文重新装回已锁定的页面。
     this.ensureGeneration(generation);
     this.setUnlocked(dataKey);
+  }
+
+  /**
+   * 导出格式化加密备份。只允许已解锁会话调用；读取封装记录与密文后，
+   * 由当前数据密钥认证完整清单。口令和明文均不进入备份。
+   */
+  async exportBackup(): Promise<BackupFile> {
+    if (this.dataKey === null) throw new LockedError('工作台已锁定');
+    const generation = this.generation;
+    const dataKey = this.dataKey;
+    const wrappedKeyRecord = await this.db.getMeta<WrappedKeyRecord>(META_WRAPPED_KEY);
+    if (wrappedKeyRecord === undefined) throw new AuthError('工作台尚未初始化');
+    const notes = await this.db.listNotes();
+    this.ensureGeneration(generation);
+    const backup = await createBackupFile(wrappedKeyRecord, notes, dataKey);
+    this.ensureGeneration(generation);
+    return backup;
+  }
+
+  /**
+   * 空库恢复：全程不进入已解锁状态，成功后仍停留在锁定页，由用户重新输入口令。
+   *
+   * 先离线解析备份、用输入口令解封 DK、认证整包清单、逐条验证密文和 100 条上限；
+   * 全部通过后才进入唯一的跨 meta/notes 写入事务。事务内最后一次确认库为空，
+   * 因此另一标签页抢先初始化、配额失败或异步处理中锁定都只能整体中止，
+   * 不会写入元数据后再留下便笺，也不会把明文送回界面。
+   */
+  async restoreBackup(backupText: string, passphrase: string): Promise<void> {
+    const generation = this.generation;
+    this.ensureGeneration(generation);
+    const parsed = parseBackupJson(backupText);
+
+    const existing = await this.db.getMeta<WrappedKeyRecord>(META_WRAPPED_KEY);
+    if (existing !== undefined) {
+      throw new AuthError('目标工作台已有数据，已取消恢复以保护现有数据');
+    }
+    const noteCount = await this.db.countNotes();
+    if (noteCount !== 0) throw new AuthError('目标工作台包含便笺，已取消恢复以保护现有数据');
+    this.ensureGeneration(generation);
+
+    const kek = await deriveKek(
+      passphrase,
+      parsed.wrappedKey.kdf.salt,
+      parsed.wrappedKey.kdf.iterations,
+    );
+    let dataKey: CryptoKey;
+    try {
+      dataKey = await unwrapDataKey(
+        parsed.wrappedKey.wrappedKey,
+        parsed.wrappedKey.wrapIv,
+        kek,
+      );
+    } catch {
+      throw new AuthError('备份口令错误，未写入任何数据');
+    }
+    this.ensureGeneration(generation);
+
+    const verified = await verifyBackupWithDataKey(parsed, dataKey, MAX_NOTES, () =>
+      this.ensureGeneration(generation),
+    );
+    this.ensureGeneration(generation);
+
+    await this.db.restoreBackupIfEmpty(
+      verified.wrappedKey,
+      verified.notes,
+      MAX_NOTES,
+      () => this.ensureGeneration(generation),
+    );
+    // 事务已整体提交即视为恢复成功；代际变化时也绝不设置解锁态，
+    // 已落盘的是完整新库，界面仍停留在锁定页且不持有明文。
   }
 
   /**

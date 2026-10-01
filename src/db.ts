@@ -85,10 +85,68 @@ export class NotesDB {
     );
   }
 
-  /** 单条 put，本身即原子：失败时旧值保持不变（首次初始化依赖这一点） */
+  /** 通用单条 meta 写入；初始化和恢复必须使用带空库检查的原子方法 */
   async putMeta(key: string, value: unknown): Promise<void> {
     await this.runTx([META_STORE], 'readwrite', async (tx) => {
       await reqToPromise(tx.objectStore(META_STORE).put(value, key));
+    });
+  }
+
+  /**
+   * 首次初始化：在覆盖 meta 与 notes 两个 store 的同一个事务里确认目标库确实为空。
+   * 用 add 而非 put 作为最后防线：另一标签页抢先初始化时，同一 origin 内
+   * 事务串行执行，本事务会因主键约束中止，不会覆盖先提交的封装。
+   */
+  async initializeEmpty(
+    record: WrappedKeyRecord,
+    checkpoint: (() => void) | null = null,
+  ): Promise<void> {
+    await this.runTx([META_STORE, NOTES_STORE], 'readwrite', async (tx) => {
+      const metaStore = tx.objectStore(META_STORE);
+      const noteStore = tx.objectStore(NOTES_STORE);
+      const existing = await reqToPromise(
+        metaStore.get(META_WRAPPED_KEY),
+      ) as WrappedKeyRecord | undefined;
+      if (existing !== undefined) throw new ConflictError('工作台已初始化');
+      const count = await reqToPromise(noteStore.count());
+      if (count !== 0) throw new ConflictError('目标库不为空，不能初始化');
+      checkpoint?.();
+      await reqToPromise(metaStore.add(record, META_WRAPPED_KEY));
+    });
+  }
+
+  /**
+   * 空库恢复：调用方必须先用输入口令解封 DK、认证清单并逐条验证密文/上限。
+   * 这里在同一个 readwrite 事务内再次确认 meta 与 notes 均为空，随后写入
+   * 封装元数据与全部便笺；任一写入失败（另一标签页抢先初始化、配额、锁定等）
+   * 都会整体回滚，绝不留下半个库。
+   */
+  async restoreBackupIfEmpty(
+    wrappedKeyRecord: WrappedKeyRecord,
+    notes: NoteRecord[],
+    maxCount: number,
+    checkpoint: (() => void) | null = null,
+  ): Promise<void> {
+    await this.runTx([META_STORE, NOTES_STORE], 'readwrite', async (tx) => {
+      const metaStore = tx.objectStore(META_STORE);
+      const noteStore = tx.objectStore(NOTES_STORE);
+
+      const existing = await reqToPromise(
+        metaStore.get(META_WRAPPED_KEY),
+      ) as WrappedKeyRecord | undefined;
+      if (existing !== undefined) throw new ConflictError('目标库已初始化，已取消恢复以保护现有数据');
+      const count = await reqToPromise(noteStore.count());
+      if (count !== 0) throw new ConflictError('目标库包含便笺，已取消恢复以保护现有数据');
+      if (notes.length > maxCount) throw new CapacityError();
+
+      checkpoint?.();
+      // add 在并发抢先初始化时触发主键约束并中止整个事务
+      await reqToPromise(metaStore.add(wrappedKeyRecord, META_WRAPPED_KEY));
+
+      for (const note of notes) {
+        checkpoint?.();
+        await reqToPromise(noteStore.put(note));
+      }
     });
   }
 
