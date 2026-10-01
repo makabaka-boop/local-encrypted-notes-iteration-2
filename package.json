@@ -1,0 +1,20 @@
+{
+  "name": "secure-notes-workbench",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "仅在浏览器内保存数据的加密便笺工作台（PBKDF2 + AES-GCM + IndexedDB）",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "verify": "npm run typecheck && npm run test && npm run build"
+  },
+  "devDependencies": {
+    "fake-indexeddb": "6.0.0",
+    "typescript": "5.6.3",
+    "vite": "5.4.11",
+    "vitest": "2.1.8"
+  }
+}

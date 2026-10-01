@@ -1,0 +1,15 @@
+# 加密便笺工作台：数据只保存在浏览器（IndexedDB），服务器仅分发静态文件。
+services:
+  # 一次性验收服务：类型检查 + 单元/集成测试 + 生产构建
+  verify:
+    build:
+      context: .
+      target: verify
+
+  # 应用服务：nginx 托管构建产物
+  app:
+    build:
+      context: .
+      target: app
+    ports:
+      - "8080:80"
