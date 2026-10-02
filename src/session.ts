@@ -1,15 +1,23 @@
 import {
+  decryptNote,
   deriveKek,
   generateDataKey,
   KDF_ITERATIONS,
+  openManifest,
   randomBytes,
   unwrapDataKey,
   wrapDataKey,
 } from './crypto';
+import {
+  canonicalManifestBytes,
+  createBackupFile,
+  parseBackupFile,
+  timingSafeEqual,
+} from './backup';
 import { META_WRAPPED_KEY, NotesDB } from './db';
-import { AuthError, LockedError } from './errors';
+import { AuthError, BackupError, LockedError } from './errors';
 import type { LockBus } from './lockbus';
-import { NoteStore } from './store';
+import { MAX_NOTES, NoteStore } from './store';
 import type { WrappedKeyRecord } from './types';
 
 export interface SessionOptions {
@@ -84,7 +92,9 @@ export class Session {
       wrappedKey,
       revision: 1,
     };
-    await this.db.putMeta(META_WRAPPED_KEY, record);
+    // 事务级「不存在才写入」：另一标签页抢先初始化/恢复时本调用被拒绝，
+    // 不会静默覆盖获胜方的封装记录
+    await this.db.initWrappedKey(record);
     // 落盘完成期间可能恰好被（另一标签页的）锁定广播打断
     this.ensureGeneration(generation);
     this.setUnlocked(dataKey);
@@ -162,6 +172,105 @@ export class Session {
   lock(): void {
     this.bus.broadcastLock();
     this.wipe();
+  }
+
+  /**
+   * 导出加密备份（仅已解锁会话可调用）：
+   * 读取封装记录与全部便笺密文，用内存中的数据密钥对清单做认证加密，
+   * 产出带格式版本的 JSON 文本。不解密便笺、不触碰口令，
+   * 因此备份里没有口令、KEK/DK 原始字节或任何明文；
+   * 锁定跨越任一 await 发生时以 LockedError 失败，绝不吐出备份。
+   */
+  async exportBackup(): Promise<string> {
+    if (this.dataKey === null) throw new LockedError('工作台已锁定');
+    const generation = this.generation;
+    const dataKey = this.dataKey;
+    const wrapped = await this.db.getMeta<WrappedKeyRecord>(META_WRAPPED_KEY);
+    if (wrapped === undefined) throw new BackupError('工作台尚未初始化，无可导出的数据');
+    this.ensureGeneration(generation);
+    const notes = await this.db.listNotes();
+    this.ensureGeneration(generation);
+    if (notes.length > MAX_NOTES) {
+      throw new BackupError(`便笺数量超过 ${MAX_NOTES} 条上限，备份中止`);
+    }
+    return createBackupFile({ wrapped, notes, dataKey });
+  }
+
+  /**
+   * 从备份恢复到**空库**。
+   *
+   * 成功边界（全部满足才写入，任一失败则库与锁定页原样不变）：
+   *  1. 文件结构/版本/字段/ID 唯一性/100 条上限（parseBackupFile）；
+   *  2. 输入口令经备份内盐与迭代次数派生 KEK 并解封数据密钥，否则 AuthError；
+   *  3. 用数据密钥打开清单封套（GCM 认证），并与重算的规范化清单逐字节一致；
+   *  4. 逐条用数据密钥解密验证每条密文（明文立即丢弃，绝不显示/保留）；
+   *  5. 同一 IndexedDB 事务内权威确认目标库确实为空（防另一标签页抢先初始化），
+   *     再写入封装元数据与全部便笺；checkpoint 拦截恢复期间发生的锁定，
+   *     配额失败/异常则事务整体回滚。
+   *
+   * 事务提交后再次确认会话代际：恢复期间被锁定则不进入解锁态、不显示明文，
+   * 数据已原子落盘，可用口令重新解锁。
+   */
+  async restoreFromBackup(backupText: string, passphrase: string): Promise<void> {
+    if (this.store !== null) {
+      throw new BackupError('当前工作台已解锁，请先锁定后再恢复');
+    }
+    const generation = this.generation;
+
+    // 友好预检：非空库直接拒绝，事务内还会再做权威检查
+    if (await this.isInitialized()) {
+      throw new BackupError('目标工作台非空：仅可在空库上恢复，已取消以保护现有数据');
+    }
+    const backup = parseBackupFile(backupText);
+    if (backup.notes.length > MAX_NOTES) {
+      throw new BackupError(`备份包含 ${backup.notes.length} 条便笺，超过 ${MAX_NOTES} 条上限`);
+    }
+
+    // 用备份自带的 KDF 参数解封数据密钥；口令错误时 GCM 校验失败
+    const kek = await deriveKek(
+      passphrase,
+      backup.wrapped.kdf.salt,
+      backup.wrapped.kdf.iterations,
+    );
+    let dataKey: CryptoKey;
+    try {
+      dataKey = await unwrapDataKey(backup.wrapped.wrappedKey, backup.wrapped.wrapIv, kek);
+    } catch {
+      throw new AuthError();
+    }
+    this.ensureGeneration(generation);
+
+    // 打开清单封套：删条、换 ID、调换密文、替换封装记录都会在此暴露
+    let opened: ArrayBuffer;
+    try {
+      opened = await openManifest(dataKey, backup.manifest.iv, backup.manifest.sealed);
+    } catch {
+      throw new BackupError('备份清单认证失败：文件可能被篡改或已损坏');
+    }
+    const canonical = canonicalManifestBytes(backup.wrapped, backup.notes);
+    if (!timingSafeEqual(new Uint8Array(opened), canonical)) {
+      throw new BackupError('备份清单与内容不一致：文件可能被篡改或已损坏');
+    }
+    this.ensureGeneration(generation);
+
+    // 逐条验证密文（明文即时丢弃，不保留、不显示）：
+    // 任何一条解不开都拒绝整包恢复
+    for (const note of backup.notes) {
+      try {
+        await decryptNote(dataKey, note.iv, note.ciphertext);
+      } catch {
+        throw new BackupError(`便笺「${note.id}」密文校验失败，恢复已取消`);
+      }
+    }
+    this.ensureGeneration(generation);
+
+    // 全部通过：同一事务内确认空库并写入元数据 + 全部便笺
+    await this.db.restoreIntoEmpty(backup.wrapped, backup.notes, () =>
+      this.ensureGeneration(generation),
+    );
+    // 提交期间会话被锁定：不恢复解锁态、不显示明文（数据已完整落盘）
+    this.ensureGeneration(generation);
+    this.setUnlocked(dataKey);
   }
 
   /** 若当前已不是发起操作时的会话代际，抛错（会话已被锁定） */

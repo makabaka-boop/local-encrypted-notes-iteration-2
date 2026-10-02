@@ -48,3 +48,15 @@ export class NotFoundError extends Error {
     this.name = 'NotFoundError';
   }
 }
+
+/**
+ * 备份文件不合法或恢复前提不满足：格式/版本不符、清单认证失败、
+ * 密文逐条验证失败、备份超过 100 条、或目标库非空等。
+ * 任何一种情况下都不会写入数据库，目标库原样保留。
+ */
+export class BackupError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'BackupError';
+  }
+}

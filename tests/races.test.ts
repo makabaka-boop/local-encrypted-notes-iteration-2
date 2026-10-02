@@ -12,6 +12,9 @@ describe('解锁与锁定竞态（会话代际防护）', () => {
 
     // B 开始解锁（PBKDF2/解封跨越多个 await）
     const unlocking = b.session.unlock('shared-pass');
+    // 立即挂上拒绝处理器：锁定经 microtask 生效，而下面先 await flush()，
+    // 否则拒绝会在 expect 接管前被记为未处理拒绝
+    unlocking.catch(() => {});
     // 解锁完成前，A 触发全标签页锁定
     a.session.lock();
     await flush();

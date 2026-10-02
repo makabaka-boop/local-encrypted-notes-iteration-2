@@ -43,3 +43,20 @@ export async function makeProbe(dbName: string) {
 export function toBytes(buf: ArrayBuffer | Uint8Array): Uint8Array {
   return buf instanceof Uint8Array ? buf : new Uint8Array(buf);
 }
+
+/**
+ * 构造一份带若干便笺的源库，并导出其加密备份文本。
+ * 供备份恢复相关测试使用。
+ */
+export async function makeBackup(
+  entries: ReadonlyArray<readonly [id: string, plaintext: string]>,
+  passphrase = 'backup-passphrase',
+) {
+  const source = await makeSession();
+  await source.session.initialize(passphrase);
+  for (const [id, plaintext] of entries) {
+    await source.session.noteStore.create(id, plaintext);
+  }
+  const text = await source.session.exportBackup();
+  return { ...source, backup: text, passphrase };
+}

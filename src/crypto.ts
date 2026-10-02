@@ -101,3 +101,31 @@ export async function decryptNote(
   const plain = await subtle.decrypt({ name: 'AES-GCM', iv }, dataKey, ciphertext);
   return new TextDecoder().decode(plain);
 }
+
+export interface SealedManifest {
+  /** 清单封套的独立随机 IV（AES-GCM，96 bit） */
+  manifestIv: Uint8Array;
+  /** 经数据密钥 AES-GCM 认证加密后的清单（密文 + GCM 认证标签） */
+  sealed: ArrayBuffer;
+}
+
+/**
+ * 用数据密钥对备份清单的规范化字节做认证加密（随机 IV）。
+ * 数据密钥只有持有正确口令解封后才能得到，因此这份 GCM 封套
+ * 同时保证清单的机密性与完整性：删条、换 ID、调换密文等任何篡改
+ * 都会在 openManifest 时被认证标签拒绝。
+ */
+export async function sealManifest(dataKey: CryptoKey, canonical: Uint8Array): Promise<SealedManifest> {
+  const manifestIv = randomBytes(12);
+  const sealed = await subtle.encrypt({ name: 'AES-GCM', iv: manifestIv }, dataKey, canonical);
+  return { manifestIv, sealed };
+}
+
+/** 打开清单封套；数据密钥不符或封套被篡改时 AES-GCM 校验失败并 reject */
+export function openManifest(
+  dataKey: CryptoKey,
+  manifestIv: Uint8Array,
+  sealed: ArrayBuffer,
+): Promise<ArrayBuffer> {
+  return subtle.decrypt({ name: 'AES-GCM', iv: manifestIv }, dataKey, sealed);
+}

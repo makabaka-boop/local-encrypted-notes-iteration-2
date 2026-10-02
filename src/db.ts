@@ -1,4 +1,4 @@
-import { CapacityError, ConflictError } from './errors';
+import { BackupError, CapacityError, ConflictError } from './errors';
 import type { NoteRecord, WrappedKeyRecord } from './types';
 
 const DB_VERSION = 1;
@@ -85,10 +85,20 @@ export class NotesDB {
     );
   }
 
-  /** 单条 put，本身即原子：失败时旧值保持不变（首次初始化依赖这一点） */
-  async putMeta(key: string, value: unknown): Promise<void> {
+  /**
+   * 首次初始化：在 readwrite 事务内「封装记录不存在才写入」。
+   * 事务级检查（而非先读后写）保证与另一标签页的初始化/恢复竞争时，
+   * 先提交者的元数据不会被后到者静默覆盖——后到者收到 ConflictError。
+   * 单条 put 本身原子：写入失败（如配额）时库保持为空。
+   */
+  async initWrappedKey(record: WrappedKeyRecord): Promise<void> {
     await this.runTx([META_STORE], 'readwrite', async (tx) => {
-      await reqToPromise(tx.objectStore(META_STORE).put(value, key));
+      const store = tx.objectStore(META_STORE);
+      const existing = await reqToPromise(store.get(META_WRAPPED_KEY));
+      if (existing !== undefined) {
+        throw new ConflictError('工作台已初始化，请直接解锁');
+      }
+      await reqToPromise(store.put(record, META_WRAPPED_KEY));
     });
   }
 
@@ -121,6 +131,40 @@ export class NotesDB {
       }
       checkpoint?.();
       await reqToPromise(store.put(nextRecord, META_WRAPPED_KEY));
+    });
+  }
+
+  /**
+   * 空库恢复：在**同一个 readwrite 事务**内先权威地确认「封装记录与便笺
+   * 都不存在」，再写入封装元数据与全部便笺。
+   *
+   * - 目标库非空（另一标签页抢先初始化/恢复）→ 事务内抛 BackupError 并中止，
+   *   已有数据一个字节都不会被动到；
+   * - checkpoint 在事务内、首条写入前一刻执行：恢复期间会话被锁定则中止；
+   * - 任一条写入失败（配额耗尽/异常）→ 整个事务回滚，
+   *   不会留下「有元数据没便笺」之类的半个库。
+   */
+  async restoreIntoEmpty(
+    wrapped: WrappedKeyRecord,
+    notes: NoteRecord[],
+    checkpoint: (() => void) | null = null,
+  ): Promise<void> {
+    await this.runTx([META_STORE, NOTES_STORE], 'readwrite', async (tx) => {
+      const metaStore = tx.objectStore(META_STORE);
+      const noteStore = tx.objectStore(NOTES_STORE);
+      const existingMeta = await reqToPromise(metaStore.get(META_WRAPPED_KEY));
+      if (existingMeta !== undefined) {
+        throw new BackupError('目标工作台非空：仅可在空库上恢复，已取消以保护现有数据');
+      }
+      const noteCount = await reqToPromise(noteStore.count());
+      if (noteCount !== 0) {
+        throw new BackupError('目标工作台非空：仅可在空库上恢复，已取消以保护现有数据');
+      }
+      checkpoint?.();
+      await reqToPromise(metaStore.put(wrapped, META_WRAPPED_KEY));
+      for (const note of notes) {
+        await reqToPromise(noteStore.put(note));
+      }
     });
   }
 

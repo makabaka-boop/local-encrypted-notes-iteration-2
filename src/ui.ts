@@ -1,4 +1,11 @@
-import { AuthError, CapacityError, ConflictError, IntegrityError, LockedError } from './errors';
+import {
+  AuthError,
+  BackupError,
+  CapacityError,
+  ConflictError,
+  IntegrityError,
+  LockedError,
+} from './errors';
 import type { Session } from './session';
 import { MAX_NOTES } from './store';
 
@@ -65,6 +72,8 @@ export class WorkbenchUI {
     };
 
     let form: HTMLElement;
+    // 空库恢复面板：仅在未初始化（库为空）的锁定页出现
+    let restorePanel: HTMLElement | null = null;
     if (initialized) {
       const input = h('input', {
         type: 'password',
@@ -139,8 +148,66 @@ export class WorkbenchUI {
         h('button', { type: 'submit' }, '创建'),
         message,
       );
+
+      // 「加密备份与空库恢复」：只有空库才允许恢复，
+      // 成功后进入主界面；任何校验失败都不写入、不显示明文。
+      const restoreFile = h('input', {
+        type: 'file',
+        accept: '.json,application/json',
+      }) as HTMLInputElement;
+      const restorePass = h('input', {
+        type: 'password',
+        placeholder: '备份的口令',
+        autocomplete: 'current-password',
+      }) as HTMLInputElement;
+      const restoreMessage = h('p', { class: 'msg', role: 'alert' });
+      const restoreBtn = h('button', { type: 'submit' }, '从备份恢复') as HTMLButtonElement;
+      restorePanel = h(
+        'form',
+        {
+          class: 'restore-panel',
+          submit: async (ev) => {
+            ev.preventDefault();
+            restoreMessage.textContent = '';
+            const file = restoreFile.files?.[0];
+            if (file === undefined) {
+              restoreMessage.textContent = '请先选择备份文件';
+              return;
+            }
+            restoreBtn.disabled = true;
+            try {
+              const text = await file.text();
+              await this.session.restoreFromBackup(text, restorePass.value);
+              restorePass.value = '';
+              restoreFile.value = '';
+              await this.renderMain();
+            } catch (err) {
+              restorePass.value = '';
+              restoreBtn.disabled = false;
+              restoreMessage.textContent =
+                err instanceof AuthError
+                  ? '口令错误，或备份已损坏，恢复未执行；空库保持原样'
+                  : err instanceof BackupError
+                    ? err.message
+                    : `恢复失败：${err instanceof Error ? err.message : String(err)}`;
+            }
+          },
+        },
+        h('h2', {}, '从加密备份恢复'),
+        h(
+          'p',
+          { class: 'hint' },
+          '仅在当前工作台为空时可用；恢复会逐条校验全部密文，任何失败都不会写入数据。',
+        ),
+        restoreFile,
+        restorePass,
+        restoreBtn,
+        restoreMessage,
+      );
     }
-    this.root.append(h('main', { class: 'locked' }, form));
+    const lockedMain = h('main', { class: 'locked' }, form);
+    if (restorePanel !== null) lockedMain.append(restorePanel);
+    this.root.append(lockedMain);
   }
 
   // ---------- 主界面 ----------
@@ -160,6 +227,30 @@ export class WorkbenchUI {
     const saveBtn = h('button', { type: 'button', disabled: true }, '保存') as HTMLButtonElement;
     const deleteBtn = h('button', { type: 'button', disabled: true }, '删除') as HTMLButtonElement;
     const newBtn = h('button', { type: 'button' }, '新建便笺') as HTMLButtonElement;
+    const exportStatus = h('span', { class: 'export-status' });
+    const exportBtn = h('button', { type: 'button' }, '导出加密备份') as HTMLButtonElement;
+
+    exportBtn.addEventListener('click', () => {
+      exportStatus.textContent = '';
+      // 异步导出：锁定/失败时不产生下载，不泄露任何明文
+      void (async () => {
+        try {
+          const backup = await this.session.exportBackup();
+          const blob = new Blob([backup], { type: 'application/json' });
+          const url = URL.createObjectURL(blob);
+          const stamp = new Date().toISOString().replaceAll(':', '-');
+          const a = h('a', { href: url, download: `secure-notes-backup-${stamp}.json` });
+          a.style.display = 'none';
+          document.body.append(a);
+          a.click();
+          a.remove();
+          URL.revokeObjectURL(url);
+          exportStatus.textContent = '备份已导出';
+        } catch (err) {
+          exportStatus.textContent = `导出失败：${err instanceof Error ? err.message : String(err)}`;
+        }
+      })();
+    });
 
     const store = this.session.noteStore;
 
@@ -367,6 +458,8 @@ export class WorkbenchUI {
           countEl,
           h('span', { class: 'spacer' }),
           newBtn,
+          exportBtn,
+          exportStatus,
           togglePwBtn,
           lockBtn,
         ),
